@@ -1,0 +1,42 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+# Poetry installs into an in-project .venv when configured to; lockfile stays tracked.
+
+# --- Env / secrets ---
+# Contains DB credentials, SECRET_KEY, etc. Never commit.
+.env
+.env.*
+!.env.example
+
+# --- FastAPI / app runtime ---
+# User-uploaded media (avatars, character art). Recreated on startup by main.py.
+/uploads/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Logs ---
+*.log
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
