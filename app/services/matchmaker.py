@@ -1,8 +1,11 @@
 import asyncio
+import logging
 from typing import Dict, List, Optional
 import time
 
 from app.services.game_manager import PlayerSession, game_manager
+
+logger = logging.getLogger(__name__)
 
 
 class MatchmakerQueue:
@@ -11,6 +14,8 @@ class MatchmakerQueue:
         self.queue: List[PlayerSession] = []
         self.wait_times: Dict[str, float] = {} # user_id -> start_time
         self.is_running = False
+        # Keep a reference so the loop task isn't garbage-collected mid-run.
+        self._task: Optional[asyncio.Task] = None
 
     def add_player(self, player: PlayerSession):
         if any(p.user_id == player.user_id for p in self.queue):
@@ -38,7 +43,13 @@ class MatchmakerQueue:
     async def _matchmaking_loop(self):
         while self.is_running:
             await asyncio.sleep(1.0)
-            await self._try_match()
+            # One failed tick (e.g. DB unavailable while creating a room) must
+            # not end matchmaking for the whole server — players stay queued
+            # and the pair is retried on the next tick.
+            try:
+                await self._try_match()
+            except Exception:
+                logger.exception("Matchmaking tick failed")
 
     async def _try_match(self):
         if len(self.queue) < 2:
@@ -89,7 +100,7 @@ class MatchmakerQueue:
     def start(self):
         if not self.is_running:
             self.is_running = True
-            asyncio.create_task(self._matchmaking_loop())
+            self._task = asyncio.create_task(self._matchmaking_loop())
 
     def stop(self):
         self.is_running = False

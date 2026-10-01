@@ -381,6 +381,114 @@ def evaluate_conditions(
     return True
 
 
+# ── Ability targeting validation ────────────────────────────────────────
+def _first_set(*values: Any) -> Any:
+    return next((v for v in values if v is not None), None)
+
+
+def ability_targeting(ability: Dict[str, Any]) -> Dict[str, Any]:
+    """What the client must pick before casting `ability`, derived from the
+    first targeting step in its chain. Mirrors `scanChainForTargeting` in
+    BattleScreen.tsx so the server accepts exactly what the UI offers.
+
+    kind: none | unit | zone | unit_then_zone | two_units. `range` None means
+    unlimited; `filter` None means the UI default for that kind."""
+    return _scan_targeting(ability.get("execution_chain") or [], ability)
+
+
+def _scan_targeting(chain: List[Dict[str, Any]], ability: Dict[str, Any]) -> Dict[str, Any]:
+    for step in chain:
+        step_type = step.get("type")
+        if step_type == "SWAP_POSITIONS":
+            return {"kind": "two_units", "range": _first_set(ability.get("range"), 2), "filter": "ALLIES"}
+        if step_type == "RELOCATE_GROUP":
+            return {"kind": "zone", "range": None}
+        sel = step.get("target_selector") or {}
+        sel_type = sel.get("type")
+        if sel_type == "CUSTOM_SELECT":
+            if step_type == "MOVE":
+                reach = _first_set(sel.get("range"), ability.get("range"), 1)
+                if str(step.get("subject", "SELF")).upper() == "TARGET":
+                    return {
+                        "kind": "unit_then_zone",
+                        "range": reach,
+                        "move_range": _first_set(step.get("move_range"), sel.get("range"), 1),
+                        "filter": sel.get("filter") or "ALLIES",
+                    }
+                return {"kind": "zone", "range": reach}
+            return {
+                "kind": "unit",
+                "range": _first_set(sel.get("range"), ability.get("range")),
+                "filter": sel.get("filter") or "ENEMIES",
+            }
+        if sel_type in ("MAIN_TARGET", "SAME_ZONE"):
+            return {"kind": "unit", "range": ability.get("range"), "filter": sel.get("filter") or "ENEMIES"}
+        if any((c or {}).get("check") == "target_has_status" for c in step.get("conditions") or []):
+            return {"kind": "unit", "range": ability.get("range"), "filter": "ENEMIES"}
+        for branch in ("if_true", "if_false"):
+            sub = _scan_targeting(step.get(branch) or [], ability)
+            if sub["kind"] != "none":
+                return sub
+    return {"kind": "none"}
+
+
+def _valid_unit_pick(
+    unit: Optional["UnitState"], actor: "UnitState", flt: Optional[str],
+    rng: Optional[int], range_bonus: int,
+) -> bool:
+    if unit is None or unit.is_dead or unit.current_hp <= 0:
+        return False
+    same_side = unit.owner_side == actor.owner_side
+    if flt == "ALLIES" and not same_side:
+        return False
+    if flt == "ENEMIES" and same_side:
+        return False
+    if rng is not None and abs(unit.zone - actor.zone) > int(rng) + range_bonus:
+        return False
+    return True
+
+
+def _valid_zone(zone: Optional[int]) -> bool:
+    return zone is not None and 0 <= zone < TOTAL_ZONES
+
+
+def validate_ability_targets(ability: Dict[str, Any], ctx: ExecutionContext) -> bool:
+    """Reject client-picked targets the ability can't legally reach: wrong
+    side, dead, out of (aura-boosted) range, or missing entirely. Called
+    before costs are paid, so an illegal request is a free no-op."""
+    spec = ability_targeting(ability)
+    kind = spec["kind"]
+    actor, bonus = ctx.actor, ctx.range_bonus
+    if kind == "none":
+        return True
+    if kind == "unit":
+        return _valid_unit_pick(ctx.custom_target, actor, spec["filter"], spec["range"], bonus)
+    if kind == "zone":
+        if not _valid_zone(ctx.custom_zone):
+            return False
+        if spec["range"] is None:
+            return True  # e.g. Mars landing: any zone, including the caster's own
+        return ctx.custom_zone != actor.zone and abs(ctx.custom_zone - actor.zone) <= spec["range"] + bonus
+    if kind == "unit_then_zone":
+        mover = ctx.custom_target
+        if not _valid_unit_pick(mover, actor, spec["filter"], spec["range"], bonus):
+            return False
+        # Throw distance is fixed — auras extend the reach to the ally only.
+        return (
+            _valid_zone(ctx.custom_zone)
+            and ctx.custom_zone != mover.zone
+            and abs(ctx.custom_zone - mover.zone) <= spec["move_range"]
+        )
+    if kind == "two_units":
+        a, b = ctx.custom_target, ctx.custom_target2
+        return (
+            a is not None and b is not None and a.unit_id != b.unit_id
+            and _valid_unit_pick(a, actor, spec["filter"], spec["range"], bonus)
+            and _valid_unit_pick(b, actor, spec["filter"], spec["range"], bonus)
+        )
+    return False
+
+
 def _is_unit_in_zone_type(unit: "UnitState", wanted: Optional[str]) -> bool:
     if wanted not in ("FRONTLINE", "BACKLINE"):
         return False
@@ -450,8 +558,10 @@ async def execute_step(
             reach = sel.get("range")
             if reach is not None and abs(ctx.custom_zone - mover.zone) > int(reach) + ctx.range_bonus:
                 return
+        from_zone = mover.zone
         if _move_unit(mover, ctx.custom_zone, battle):
             ctx.moved_units.append(mover)
+            room.record_move(mover, from_zone, "carry" if subject == "TARGET" else "dash", by=ctx.actor)
         return
 
     if step_type == "GRANT_MODIFIER":
@@ -489,6 +599,8 @@ async def execute_step(
         battle.zones[zb].append(a.unit_id)
         battle.zones[za].append(b.unit_id)
         ctx.moved_units.extend([a, b])
+        room.record_move(a, za, "swap", by=ctx.actor)
+        room.record_move(b, zb, "swap", by=ctx.actor)
         return
 
     targets = resolve_targets(step.get("target_selector", {}), ctx, battle)
@@ -498,15 +610,19 @@ async def execute_step(
         if ctx.custom_zone is None:
             return
         for u in targets:
+            from_zone = u.zone
             if _move_unit(u, ctx.custom_zone, battle):
                 ctx.moved_units.append(u)
+                room.record_move(u, from_zone, "relocate", by=ctx.actor)
         return
 
     if step_type == "PULL_TARGET":
         # Drag selected target(s) into the actor's zone (Goggins' Carry the Log).
         for t in targets:
+            from_zone = t.zone
             if t.unit_id != ctx.actor.unit_id and _move_unit(t, ctx.actor.zone, battle):
                 ctx.moved_units.append(t)
+                room.record_move(t, from_zone, "pull", by=ctx.actor)
         return
 
     if step_type == "ADD_STACK":
@@ -540,7 +656,8 @@ async def execute_step(
         dmg_type = step.get("damage_type") or "PHYSICAL"
         for t in targets:
             source_range = abs(t.zone - ctx.actor.zone)
-            _apply_damage(t, amount, ctx.actor, source_range, dmg_type)
+            lost = _apply_damage(t, amount, ctx.actor, source_range, dmg_type)
+            room.record_damage(ctx.actor, t, lost, str(dmg_type).upper())
             # Record the hit so the post-action passive dispatcher can react
             # (retaliation / on-deal / after-action). Passive-sourced damage
             # runs with triggers_passives=False and is intentionally skipped.
@@ -549,7 +666,9 @@ async def execute_step(
     elif step_type == "HEAL":
         amount = resolve_value(step.get("value"), ctx, cache)
         for t in targets:
+            before = t.current_hp
             t.current_hp = min(t.max_hp, t.current_hp + amount)
+            room.record_heal(ctx.actor, t, t.current_hp - before)
     elif step_type == "APPLY_STATUS":
         name = step.get("status_name")
         if not name:
@@ -573,8 +692,11 @@ async def execute_step(
                 status["group"] = group
             if _self_fresh(ctx, t):
                 status["fresh"] = True
+            # Who applied it — poison ticks are credited to this unit.
+            status["source"] = ctx.actor.unit_id
             t.statuses.append(status)
             recompute_derived(t, cache)
+            _emit_status(room, ctx, t, status)
     elif step_type == "REMOVE_STATUS":
         name = step.get("status_name")
         for t in targets:
@@ -598,6 +720,7 @@ async def execute_step(
                 status["fresh"] = True
             t.statuses.append(status)
             recompute_derived(t, cache)
+            _emit_status(room, ctx, t, status)
     elif step_type == "BUFF_STAT":
         stat = str(step.get("stat", "DEFENSE")).upper()
         value = resolve_value(step.get("value", 0), ctx, cache)
@@ -614,6 +737,7 @@ async def execute_step(
                 status["fresh"] = True
             t.statuses.append(status)
             recompute_derived(t, cache)
+            _emit_status(room, ctx, t, status)
     elif step_type == "ENERGY_GAIN":
         amount = resolve_value(step.get("value", 0), ctx, cache)
         for t in targets:
@@ -625,6 +749,15 @@ async def execute_step(
     # unknown step types silently no-op
 
 
+def _emit_status(room: "GameRoom", ctx: ExecutionContext, target: "UnitState", status: Dict[str, Any]) -> None:
+    """Log a freshly applied status (buff or debuff) for the client feed."""
+    room.emit({
+        "t": "status", "src": ctx.actor.unit_id, "dst": target.unit_id,
+        "name": status["name"], "value": status.get("value"),
+        "duration": status.get("duration"), "group": status.get("group"),
+    })
+
+
 # ── Mutation helpers (re-exported for game_manager) ─────────────────────
 def _apply_damage(
     target: "UnitState",
@@ -632,8 +765,8 @@ def _apply_damage(
     attacker: Optional["UnitState"],
     source_range: int,
     damage_type: str = "PHYSICAL",
-) -> None:
-    """Apply damage with a 1-minimum floor.
+) -> int:
+    """Apply damage with a 1-minimum floor. Returns the HP actually lost.
 
     PHYSICAL is reduced by the target's `current_defense`; MAGICAL ignores
     defense entirely. Isolation adjusts the raw amount first (an isolated
@@ -655,7 +788,9 @@ def _apply_damage(
         final = max(1, raw)
     else:
         final = max(1, raw - target.current_defense)
+    before = target.current_hp
     target.current_hp = max(0, target.current_hp - final)
+    return before - target.current_hp
 
 
 def _move_unit(unit: "UnitState", target_zone: int, battle: "BattleState") -> bool:
