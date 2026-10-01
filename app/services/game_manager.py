@@ -20,18 +20,22 @@ The disconnect-forfeit grace-period machinery from Phase 1 is preserved.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Set
 
 from fastapi import WebSocket
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
 
 from app.models.user import User
 from app.services import character as character_service
 from app.services import effects
+
+logger = logging.getLogger(__name__)
 
 Side = Literal["LEFT", "RIGHT"]
 Stage = Literal["DRAFT_BAN", "DRAFT_PICK", "BATTLE", "FINISHED"]
@@ -66,13 +70,27 @@ ISOLATION_STATUS = "ISOLATION"
 RECONNECT_GRACE_SECONDS = 30
 NOTIFY_DELAY_SECONDS = 3
 
+# Turn clock. When it runs out the server plays the turn for the idle side:
+# a random ban/pick in the draft, a skipped activation in battle. Running out
+# AFK_TIMEOUTS_TO_FORFEIT times in a row loses the match. A battle turn is
+# long on purpose: reading the board and planning a combo takes time.
+DRAFT_TURN_SECONDS = 45
+BATTLE_TURN_SECONDS = 165
+AFK_TIMEOUTS_TO_FORFEIT = 3
+
+# Why a match ended — sent with GAME_FINISHED so the client can say it.
+EndReason = Literal["score", "surrender", "disconnect", "afk"]
+
+# Nobody's rating drops below this.
+ELO_FLOOR = 100
+
 
 # ── Player + battle data ────────────────────────────────────────────────
 
 class PlayerSession:
     """Lightweight wrapper around a connected user. Lives for the room's
     lifetime. `websocket` is mutated on reconnect to point at the new socket.
-    `score` is only consulted by `finish_game` for ELO math."""
+    `timeouts` counts turns in a row the turn clock ran out on this player."""
 
     def __init__(self, user: User, websocket: WebSocket):
         self.user_id = str(user.id)
@@ -82,7 +100,7 @@ class PlayerSession:
         self.elo = user.elo
         self.websocket = websocket
         self.side: Side = "LEFT"  # set when joining a room
-        self.score = 0  # forfeit / future-battle outcome, used by ELO calc
+        self.timeouts = 0
 
 
 @dataclass
@@ -129,6 +147,12 @@ class UnitState:
     # is the round number on which it returns to its backline at full HP.
     is_dead: bool = False
     respawn_round: Optional[int] = None
+    # Match statistics for the result screen, and the last enemy that damaged
+    # this unit (credited with the kill if it dies, even to a later poison tick).
+    stats: Dict[str, int] = field(default_factory=lambda: {
+        "kills": 0, "deaths": 0, "damage_dealt": 0, "damage_taken": 0, "healing": 0,
+    })
+    last_hit_by: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -151,6 +175,7 @@ class UnitState:
             "zone": self.zone,
             "is_dead": self.is_dead,
             "respawn_round": self.respawn_round,
+            "stats": dict(self.stats),
         }
 
 
@@ -247,6 +272,19 @@ class GameRoom:
         # Transient log of passives that fired since the last broadcast. Flushed
         # to clients as a PASSIVE_PROC message so the UI can flash them.
         self._proc_log: List[Dict[str, Any]] = []
+        # Battle events (damage, moves with their cause, deaths…) since the last
+        # broadcast. Shipped inside the next ROOM_STATE so the client can log
+        # and animate exactly what happened alongside the new snapshot.
+        self._events: List[Dict[str, Any]] = []
+        # Serialises everything that mutates the room: both players' actions,
+        # the turn clock and the disconnect forfeit.
+        self._lock = asyncio.Lock()
+        # Turn clock. `_turn_id` bumps on every hand-over so a timer that fires
+        # late can tell the turn it was armed for is already over.
+        self._turn_id = 0
+        self._clock_task: Optional[asyncio.Task] = None
+        self._turn_deadline: Optional[float] = None
+        self.turn_seconds: Optional[int] = None
 
     # ── routing helpers ────────────────────────────────────────────────
     def get_player_by_side(self, side: Side) -> Optional[PlayerSession]:
@@ -275,6 +313,155 @@ class GameRoom:
                 # bookkeeping handles cleanup elsewhere. Don't let one bad
                 # socket prevent the other from receiving the update.
                 pass
+
+    # ── battle events / stats ──────────────────────────────────────────
+    def emit(self, event: Dict[str, Any]) -> None:
+        if self.battle is not None:
+            self._events.append(event)
+
+    def record_damage(
+        self, source: Optional[UnitState], target: UnitState, amount: int, damage_type: str,
+    ) -> None:
+        """Book HP actually lost: stats, kill credit, and a log event."""
+        if amount <= 0:
+            return
+        target.stats["damage_taken"] += amount
+        if source is not None and source.owner_side != target.owner_side:
+            source.stats["damage_dealt"] += amount
+            target.last_hit_by = source.unit_id
+        self.emit({
+            "t": "damage", "src": source.unit_id if source else None,
+            "dst": target.unit_id, "amount": amount, "dtype": damage_type,
+        })
+
+    def record_heal(self, source: Optional[UnitState], target: UnitState, amount: int) -> None:
+        if amount <= 0:
+            return
+        if source is not None:
+            source.stats["healing"] += amount
+        self.emit({
+            "t": "heal", "src": source.unit_id if source else None,
+            "dst": target.unit_id, "amount": amount,
+        })
+
+    def record_move(
+        self, unit: UnitState, from_zone: int, cause: str, by: Optional[UnitState] = None,
+    ) -> None:
+        """`cause` drives the client animation: walk, pull, swap, dash, carry,
+        relocate."""
+        self.emit({
+            "t": "move", "unit": unit.unit_id, "from": from_zone, "to": unit.zone,
+            "cause": cause, "by": by.unit_id if by else None,
+        })
+
+    def match_summary(self) -> Dict[str, Any]:
+        battle = self.battle
+        if battle is None:
+            return {"rounds": 0, "units": []}
+        return {
+            "rounds": battle.current_round,
+            "units": [
+                {
+                    "unit_id": u.unit_id, "char_id": u.char_id,
+                    "owner_side": u.owner_side, "stats": dict(u.stats),
+                }
+                for u in battle.units.values()
+            ],
+        }
+
+    # ── turn clock ─────────────────────────────────────────────────────
+    def _start_turn_clock(self, seconds: int) -> None:
+        """(Re)arm the clock for whoever's turn it now is."""
+        self._turn_id += 1
+        self.turn_seconds = seconds
+        self._turn_deadline = time.monotonic() + seconds
+        self._cancel_clock()
+        self._clock_task = asyncio.create_task(self._run_clock(self._turn_id, seconds))
+
+    def _cancel_clock(self) -> None:
+        task = self._clock_task
+        # A timeout handler that hands the turn over re-arms the clock from
+        # inside the old timer task — never cancel ourselves mid-handler.
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        self._clock_task = None
+
+    def _stop_turn_clock(self) -> None:
+        self._turn_id += 1
+        self._cancel_clock()
+        self._turn_deadline = None
+        self.turn_seconds = None
+
+    def _turn_timer_payload(self) -> Optional[Dict[str, Any]]:
+        if self._turn_deadline is None or self.stage == "FINISHED":
+            return None
+        remaining = max(0.0, self._turn_deadline - time.monotonic())
+        return {"seconds": self.turn_seconds, "remaining_ms": int(remaining * 1000)}
+
+    async def _run_clock(self, turn_id: int, seconds: int) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        async with self._lock:
+            if turn_id != self._turn_id or self.stage == "FINISHED":
+                return
+            try:
+                async with _db_session() as db:
+                    await self._on_turn_timeout(db)
+            except Exception:
+                logger.exception("Turn timeout failed in room %s", self.room_id)
+
+    async def _on_turn_timeout(self, db: AsyncSession) -> None:
+        """The side to move ran out of time: play the turn for them, or forfeit
+        the match once they've been idle AFK_TIMEOUTS_TO_FORFEIT turns in a row."""
+        side = self._current_side()
+        player = self.get_player_by_side(side) if side else None
+        if player is None:
+            return
+        player.timeouts += 1
+        if player.timeouts >= AFK_TIMEOUTS_TO_FORFEIT:
+            await self._forfeit(player, db, reason="afk")
+            return
+
+        if self.stage == "DRAFT_BAN":
+            pool = self.draft.available_pool
+            if pool:
+                await self._handle_ban(player, {"char_id": random.choice(pool)}, db)
+        elif self.stage == "DRAFT_PICK":
+            pool = self.draft.available_pool
+            if pool:
+                await self._handle_pick(player, {"char_id": random.choice(pool)}, db)
+        elif self.stage == "BATTLE":
+            await self._skip_battle_turn(player, db)
+
+    async def _skip_battle_turn(self, player: PlayerSession, db: AsyncSession) -> None:
+        """Spend the idle side's turn: end the active unit's activation, or —
+        if none was picked — activate their first ready unit and end it."""
+        battle = self.battle
+        assert battle is not None
+        unit = self._owned_active_unit(player, alive_only=False)
+        if unit is None:
+            ready = [
+                u for u in battle.units.values()
+                if u.owner_side == player.side and not u.has_moved and u.current_hp > 0
+            ]
+            if not ready:
+                self._start_turn_clock(BATTLE_TURN_SECONDS)
+                return
+            await self._battle_activate(player, {"unit_id": ready[0].unit_id}, db)
+            if self.stage != "BATTLE":
+                return
+            # Activation may already have ended the turn (stunned / died).
+            unit = self._owned_active_unit(player, alive_only=False)
+            if unit is None:
+                return
+        self.emit({"t": "skip", "unit": unit.unit_id, "reason": "timeout"})
+        await self._battle_end_turn(player, db)
+
+    async def _forfeit(self, loser: PlayerSession, db: AsyncSession, *, reason: EndReason) -> None:
+        winner = self.get_opponent(loser)
+        await game_manager.finish_game(self, db, winner_side=winner.side, reason=reason)
 
     def _players_payload(self) -> Dict[str, Any]:
         return {
@@ -313,6 +500,7 @@ class GameRoom:
             full_roster_ids=full_roster_ids,
         )
         self.stage = "DRAFT_BAN" if bans_enabled else "DRAFT_PICK"
+        self._start_turn_clock(DRAFT_TURN_SECONDS)
 
     async def begin_battle(self, db: AsyncSession):
         """Spawn picked characters onto the field. Called when picks complete."""
@@ -376,6 +564,7 @@ class GameRoom:
         self.stage = "BATTLE"
         # Seed isolation + aura modifiers for the opening turn.
         self._recompute_board()
+        self._start_turn_clock(BATTLE_TURN_SECONDS)
 
     # ── action handling ────────────────────────────────────────────────
     async def handle_action(self, user_id: str, action: Dict[str, Any], db: AsyncSession):
@@ -385,32 +574,56 @@ class GameRoom:
 
         action_type = action.get("type")
 
-        # Inspection telegraph: relay which unit a player is looking at to the
-        # opponent (works in any stage; purely cosmetic awareness).
-        if action_type == "INSPECT":
+        # Intent telegraph: relay what a player is currently doing to the
+        # opponent (inspecting a hero, choosing a target, hovering an ability,
+        # moving). Works in any stage; purely cosmetic awareness.
+        if action_type == "INTENT":
             opp = self.get_opponent(player)
-            try:
-                await opp.websocket.send_json({
-                    "type": "OPPONENT_INSPECT",
-                    "unit_id": action.get("unit_id"),
-                })
-            except Exception:
-                pass
+            if opp is not None:
+                try:
+                    await opp.websocket.send_json({
+                        "type": "OPPONENT_INTENT",
+                        "intent": action.get("intent"),         # kind or None
+                        "unit_id": action.get("unit_id"),
+                        "ability_name": action.get("ability_name"),
+                    })
+                except Exception:
+                    pass
             return
 
-        if self.stage == "DRAFT_BAN":
-            if action_type == "BAN_CHARACTER":
-                await self._handle_ban(player, action, db)
-            return
+        async with self._lock:
+            if self.stage == "FINISHED":
+                return
 
-        if self.stage == "DRAFT_PICK":
-            if action_type == "PICK_CHARACTER":
-                await self._handle_pick(player, action, db)
-            return
+            # Either player may give up at any point, on their turn or not.
+            if action_type == "SURRENDER":
+                await self._forfeit(player, db, reason="surrender")
+                return
 
-        if self.stage == "BATTLE":
-            await self._handle_battle_action(player, action, db)
-            return
+            # Acting on your own turn proves you're not AFK.
+            if self._current_side() == player.side:
+                player.timeouts = 0
+
+            if self.stage == "DRAFT_BAN":
+                if action_type == "BAN_CHARACTER":
+                    await self._handle_ban(player, action, db)
+                return
+
+            if self.stage == "DRAFT_PICK":
+                if action_type == "PICK_CHARACTER":
+                    await self._handle_pick(player, action, db)
+                return
+
+            if self.stage == "BATTLE":
+                await self._handle_battle_action(player, action, db)
+                return
+
+    def _current_side(self) -> Optional[Side]:
+        if self.stage in ("DRAFT_BAN", "DRAFT_PICK") and self.draft is not None:
+            return self.draft.current_side
+        if self.stage == "BATTLE" and self.battle is not None:
+            return self.battle.current_actor_side
+        return None
 
     # ── battle action handling ─────────────────────────────────────────
     async def _handle_battle_action(
@@ -482,6 +695,15 @@ class GameRoom:
             return
 
         battle.active_unit_id = unit.unit_id
+
+        # A stunned unit has nothing to do — spend its activation right away
+        # instead of making the player click through it.
+        if self._is_stunned(unit):
+            self.emit({"t": "skip", "unit": unit.unit_id, "reason": "stun"})
+            unit.has_moved = True
+            await self._after_unit_done(unit)
+            return
+
         await self.broadcast_state()
 
     async def _battle_move(
@@ -505,10 +727,12 @@ class GameRoom:
             return
 
         # Apply move
+        from_zone = unit.zone
         battle.zones[unit.zone].remove(unit.unit_id)
         unit.zone = target_zone
         battle.zones[target_zone].append(unit.unit_id)
         unit.move_count += 1
+        self.record_move(unit, from_zone, "walk")
 
         # Stepping onto / off enemy territory toggles isolation; positions also
         # feed range-based auras.
@@ -520,6 +744,7 @@ class GameRoom:
         await self.broadcast_state()
         if self._score_reached():
             return await self._end_game_combat(db)
+        await self._end_turn_if_dead(unit)
 
     async def _battle_attack(
         self, player: PlayerSession, action: Dict[str, Any], db: AsyncSession,
@@ -580,6 +805,7 @@ class GameRoom:
             attacker_range=int(attack_def.get("range", 1)),
             is_owner_turn=True,
         )
+        self.emit({"t": "attack", "unit": attacker.unit_id, "target": target.unit_id})
         await effects.execute_chain(chain, ctx, self)
         attacker.has_attacked = True
 
@@ -595,6 +821,7 @@ class GameRoom:
         if self._score_reached():
             await self._end_game_combat(db)
             return
+        await self._end_turn_if_dead(attacker)
 
     async def _battle_use_ability(
         self, player: PlayerSession, action: Dict[str, Any], db: AsyncSession,
@@ -659,14 +886,6 @@ class GameRoom:
         if isinstance(action.get("target_zone"), int):
             custom_zone = int(action["target_zone"])
 
-        # Spend the ability's costs up front so a chain that loops back
-        # somewhere can't double-charge.
-        actor.current_energy = max(0, actor.current_energy - cost)
-        if cd > 0:
-            actor.cooldowns[ab_key] = cd
-        if not is_quick:
-            actor.has_used_ability = True
-
         ctx = effects.ExecutionContext(
             actor=actor,
             main_target=custom_target,  # used by MAIN_TARGET and SAME_ZONE selectors
@@ -677,6 +896,23 @@ class GameRoom:
             range_bonus=actor.modifiers.get("ABILITY_RANGE", 0),
             is_owner_turn=True,
         )
+        # The client only offers legal targets, but never trust it: range, side
+        # and liveness are re-checked here, before any cost is paid.
+        if not effects.validate_ability_targets(ability, ctx):
+            return
+
+        # Spend the ability's costs up front so a chain that loops back
+        # somewhere can't double-charge.
+        actor.current_energy = max(0, actor.current_energy - cost)
+        if cd > 0:
+            actor.cooldowns[ab_key] = cd
+        if not is_quick:
+            actor.has_used_ability = True
+
+        self.emit({
+            "t": "ability", "unit": actor.unit_id, "ability_id": ab_key,
+            "target": custom_target.unit_id if custom_target else None,
+        })
         await effects.execute_chain(ability.get("execution_chain") or [], ctx, self)
 
         # Reactive passives provoked by the ability's damage.
@@ -696,11 +932,12 @@ class GameRoom:
         if self._score_reached():
             await self._end_game_combat(db)
             return
+        await self._end_turn_if_dead(actor)
 
     async def _battle_end_turn(self, player: PlayerSession, db: AsyncSession):
         battle = self.battle
         assert battle is not None
-        unit = self._owned_active_unit(player)
+        unit = self._owned_active_unit(player, alive_only=False)
         if unit is None:
             return
         unit.has_moved = True
@@ -708,14 +945,27 @@ class GameRoom:
         await self._after_unit_done(unit)
 
     # ── battle helpers ────────────────────────────────────────────────
-    def _owned_active_unit(self, player: PlayerSession) -> Optional[UnitState]:
+    def _owned_active_unit(
+        self, player: PlayerSession, *, alive_only: bool = True,
+    ) -> Optional[UnitState]:
         battle = self.battle
         if battle is None or battle.active_unit_id is None:
             return None
         unit = battle.units.get(battle.active_unit_id)
         if unit is None or unit.owner_side != player.side:
             return None
+        # A corpse can't move, attack or cast — only END_TURN may address it.
+        if alive_only and unit.is_dead:
+            return None
         return unit
+
+    async def _end_turn_if_dead(self, unit: UnitState) -> None:
+        """The acting unit died during its own activation (e.g. to retaliation):
+        its turn is over, hand it to the next actor."""
+        battle = self.battle
+        if battle is None or battle.active_unit_id != unit.unit_id or not unit.is_dead:
+            return
+        await self._after_unit_done(unit)
 
     @staticmethod
     def _opposite_side(side: Side) -> Side:
@@ -782,7 +1032,10 @@ class GameRoom:
                 if status.get("name") == "POISON":
                     value = int(status.get("value", 0) or 0)
                     if value > 0:
+                        before = unit.current_hp
                         unit.current_hp = max(0, unit.current_hp - value)
+                        source = self.battle.units.get(status.get("source") or "") if self.battle else None
+                        self.record_damage(source, unit, before - unit.current_hp, "POISON")
 
     def _decrement_status_durations(self, unit: UnitState):
         """Called after a unit's micro-turn completes. -1 to every duration;
@@ -845,6 +1098,7 @@ class GameRoom:
             ):
                 await self._start_new_round()
 
+        self._start_turn_clock(BATTLE_TURN_SECONDS)
         await self.broadcast_state()
 
     def _has_available_unit(self, side: Side) -> bool:
@@ -876,6 +1130,19 @@ class GameRoom:
                 killer_side = self._opposite_side(unit.owner_side)
                 battle.scores[killer_side] += 1
 
+                unit.stats["deaths"] += 1
+                killer = battle.units.get(unit.last_hit_by or "")
+                if killer is not None and killer.owner_side == killer_side:
+                    killer.stats["kills"] += 1
+                else:
+                    killer = None
+                unit.last_hit_by = None
+                self.emit({
+                    "t": "death", "unit": unit.unit_id,
+                    "killer": killer.unit_id if killer else None,
+                    "respawn_round": unit.respawn_round,
+                })
+
     def _score_reached(self) -> bool:
         battle = self.battle
         if battle is None:
@@ -901,6 +1168,8 @@ class GameRoom:
         unit.statuses = []
         unit.cooldowns = {}
         unit.is_dead = False
+        unit.last_hit_by = None
+        self.emit({"t": "respawn", "unit": unit.unit_id, "zone": home})
         unit.respawn_round = None
         unit.has_moved = False
         unit.has_attacked = False
@@ -991,14 +1260,21 @@ class GameRoom:
             # Only flash the proc if the chain actually changed something — a
             # no-op pass (e.g. +energy-per-stack with 0 stacks) shouldn't show.
             before = self._battle_fingerprint()
+            log_at = len(self._events)
             await effects.execute_chain(passive.get("execution_chain") or [], ctx, self)
             if self._battle_fingerprint() != before:
+                name = passive.get("name") or "Пассивка"
                 self._proc_log.append({
                     "unit_id": unit.unit_id,
                     "id": passive.get("id"),
-                    "name": passive.get("name") or "Пассивка",
+                    "name": name,
                     "trigger": trigger,
                 })
+                if self.battle is not None:
+                    self._events.insert(log_at, {
+                        "t": "passive", "unit": unit.unit_id,
+                        "id": passive.get("id"), "name": name,
+                    })
 
     def _battle_fingerprint(self):
         """Cheap snapshot of mutable battle state — used to detect whether a
@@ -1078,6 +1354,7 @@ class GameRoom:
         if battle is None:
             return
         battle.current_round += 1
+        self.emit({"t": "round", "round": battle.current_round})
         for u in battle.units.values():
             if u.is_dead:
                 # Respawn if its timer is up; otherwise the corpse waits
@@ -1114,13 +1391,15 @@ class GameRoom:
         self._recompute_board()
 
     async def _end_game_combat(self, db: AsyncSession):
-        """Hand the final kill scores to the players so finish_game's ELO maths
-        (which compares score_a vs score_b) picks the side with more kills."""
+        """Someone reached SCORE_TO_WIN: the side with more kills wins."""
         battle = self.battle
+        winner: Optional[Side] = None
         if battle is not None:
-            self.player1.score = battle.scores["LEFT"]   # player1 == LEFT
-            self.player2.score = battle.scores["RIGHT"]  # player2 == RIGHT
-        await game_manager.finish_game(self, db)
+            if battle.scores["LEFT"] > battle.scores["RIGHT"]:
+                winner = "LEFT"
+            elif battle.scores["RIGHT"] > battle.scores["LEFT"]:
+                winner = "RIGHT"
+        await game_manager.finish_game(self, db, winner_side=winner, reason="score")
 
     async def _handle_ban(self, player: PlayerSession, action: Dict[str, Any], db: AsyncSession):
         draft = self.draft
@@ -1145,6 +1424,7 @@ class GameRoom:
         else:
             draft.current_side = "RIGHT" if player.side == "LEFT" else "LEFT"
 
+        self._start_turn_clock(DRAFT_TURN_SECONDS)
         await self.broadcast_state()
 
     async def _handle_pick(self, player: PlayerSession, action: Dict[str, Any], db: AsyncSession):
@@ -1167,10 +1447,13 @@ class GameRoom:
             await self.broadcast_state()
         else:
             draft.current_side = "RIGHT" if player.side == "LEFT" else "LEFT"
+            self._start_turn_clock(DRAFT_TURN_SECONDS)
             await self.broadcast_state()
 
     # ── outgoing state ─────────────────────────────────────────────────
-    def state_payload(self, *, is_reconnect: bool = False) -> Dict[str, Any]:
+    def state_payload(
+        self, *, is_reconnect: bool = False, events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Single shape for any stage. Frontend dispatches on `stage`."""
         return {
             "type": "RECONNECT" if is_reconnect else "ROOM_STATE",
@@ -1179,10 +1462,14 @@ class GameRoom:
             "players": self._players_payload(),
             "draft": self.draft.to_dict() if self.draft else None,
             "battle": self.battle.to_dict() if self.battle else None,
+            "turn_timer": self._turn_timer_payload(),
+            # What happened since the previous snapshot (empty on reconnect).
+            "events": events or [],
         }
 
     async def broadcast_state(self):
-        await self.broadcast(self.state_payload(is_reconnect=False))
+        events, self._events = self._events, []
+        await self.broadcast(self.state_payload(is_reconnect=False, events=events))
         # Flush any passive procs that fired while resolving this update so the
         # UI can flash them on top of the fresh state.
         if self._proc_log:
@@ -1215,11 +1502,12 @@ class GameManager:
     ) -> GameRoom:
         room_id = str(uuid.uuid4())
         room = GameRoom(room_id, p1, p2)
+        # Seed the draft before registering the room: if the DB call fails, no
+        # half-built room is left claiming both players.
+        await room.begin_draft(db)
         self.active_rooms[room_id] = room
         self.player_to_room[p1.user_id] = room_id
         self.player_to_room[p2.user_id] = room_id
-
-        await room.begin_draft(db)
 
         # First message: announce the match. Then a state snapshot.
         await room.broadcast({
@@ -1300,17 +1588,14 @@ class GameManager:
             self.notified_disconnects.discard(user_id)
             return
 
-        opp = room.get_opponent(disconnected)
-        disconnected.score = -1
-        opp.score = 999
-
-        from app.core.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as db:
-            try:
-                await self.finish_game(room, db)
-            finally:
-                self.pending_forfeits.pop(user_id, None)
-                self.notified_disconnects.discard(user_id)
+        try:
+            async with room._lock:
+                if room.stage != "FINISHED":
+                    async with _db_session() as db:
+                        await room._forfeit(disconnected, db, reason="disconnect")
+        finally:
+            self.pending_forfeits.pop(user_id, None)
+            self.notified_disconnects.discard(user_id)
 
     # ── game end / ELO (unchanged math, new shape) ─────────────────────
     def calculate_elo_change(
@@ -1328,67 +1613,99 @@ class GameManager:
         delta_a = round(K * (S_a - E_a))
         delta_b = -delta_a  # zero-sum after rounding
 
-        if elo_a + delta_a < 100:
-            delta_a = 100 - elo_a
+        if elo_a + delta_a < ELO_FLOOR:
+            delta_a = ELO_FLOOR - elo_a
             delta_b = -delta_a
-        if elo_b + delta_b < 100:
-            delta_b = 100 - elo_b
+        if elo_b + delta_b < ELO_FLOOR:
+            delta_b = ELO_FLOOR - elo_b
             delta_a = -delta_b
 
         return delta_a, delta_b
 
-    async def finish_game(self, room: GameRoom, db: AsyncSession):
+    async def _apply_result(
+        self, db: AsyncSession, player: PlayerSession, delta: int, margin: int,
+    ) -> Optional[int]:
+        """Atomically add one match result to the user's row and return the new
+        ELO (None if the user no longer exists). Done as `elo = elo + delta` in
+        SQL so a stale in-memory User can never overwrite an earlier result."""
+        stmt = (
+            update(User)
+            .where(User.id == uuid.UUID(player.user_id))
+            .values(
+                elo=func.greatest(User.elo + delta, ELO_FLOOR),
+                games_played=User.games_played + 1,
+                wins=User.wins + (1 if margin > 0 else 0),
+                losses=User.losses + (1 if margin < 0 else 0),
+            )
+            .returning(User.elo)
+            .execution_options(synchronize_session=False)
+        )
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def finish_game(
+        self, room: GameRoom, db: AsyncSession, *,
+        winner_side: Optional[Side], reason: EndReason = "score",
+    ):
+        """Close the match: `winner_side` None is a draw. The kill score shown
+        to players is always the real one, whatever ended the match."""
         room.stage = "FINISHED"
+        room._stop_turn_clock()
         p1, p2 = room.player1, room.player2
-        delta_1, delta_2 = self.calculate_elo_change(p1.elo, p2.elo, p1.score, p2.score)
+        outcome_1 = 1 if winner_side == p1.side else 0
+        outcome_2 = 1 if winner_side == p2.side else 0
+        delta_1, delta_2 = self.calculate_elo_change(p1.elo, p2.elo, outcome_1, outcome_2)
+        new_elo_1, new_elo_2 = p1.elo + delta_1, p2.elo + delta_2
+        scores = room.battle.scores if room.battle else {"LEFT": 0, "RIGHT": 0}
 
-        result1 = await db.execute(select(User).filter(User.id == uuid.UUID(p1.user_id)))
-        user1 = result1.scalars().first()
-        result2 = await db.execute(select(User).filter(User.id == uuid.UUID(p2.user_id)))
-        user2 = result2.scalars().first()
-
-        if user1 and user2:
-            user1.elo += delta_1
-            user1.games_played += 1
-            if p1.score > p2.score:
-                user1.wins += 1
-            elif p1.score < p2.score:
-                user1.losses += 1
-
-            user2.elo += delta_2
-            user2.games_played += 1
-            if p2.score > p1.score:
-                user2.wins += 1
-            elif p2.score < p1.score:
-                user2.losses += 1
-
+        try:
+            stored_1 = await self._apply_result(db, p1, delta_1, outcome_1 - outcome_2)
+            stored_2 = await self._apply_result(db, p2, delta_2, outcome_2 - outcome_1)
             await db.commit()
+            new_elo_1 = stored_1 if stored_1 is not None else new_elo_1
+            new_elo_2 = stored_2 if stored_2 is not None else new_elo_2
+        except Exception:
+            # Still announce the result and free the room — a DB hiccup must not
+            # leave both players stuck in a FINISHED room until restart.
+            logger.exception("Failed to persist result of room %s", room.room_id)
+            await db.rollback()
 
-        await room.broadcast({
-            "type": "GAME_FINISHED",
-            "room_id": room.room_id,
-            "players": room._players_payload(),
-            "results": {
-                "LEFT": {
-                    "score": p1.score,
-                    "elo_change": delta_1,
-                    "new_elo": p1.elo + delta_1,
-                    "is_winner": p1.score > p2.score,
-                    "is_draw": p1.score == p2.score,
+        try:
+            await room.broadcast({
+                "type": "GAME_FINISHED",
+                "room_id": room.room_id,
+                "players": room._players_payload(),
+                "reason": reason,
+                "winner": winner_side,
+                "summary": room.match_summary(),
+                "results": {
+                    "LEFT": {
+                        "score": scores["LEFT"],
+                        "elo_change": delta_1,
+                        "new_elo": new_elo_1,
+                        "is_winner": winner_side == "LEFT",
+                        "is_draw": winner_side is None,
+                    },
+                    "RIGHT": {
+                        "score": scores["RIGHT"],
+                        "elo_change": delta_2,
+                        "new_elo": new_elo_2,
+                        "is_winner": winner_side == "RIGHT",
+                        "is_draw": winner_side is None,
+                    },
                 },
-                "RIGHT": {
-                    "score": p2.score,
-                    "elo_change": delta_2,
-                    "new_elo": p2.elo + delta_2,
-                    "is_winner": p2.score > p1.score,
-                    "is_draw": p1.score == p2.score,
-                },
-            },
-        })
+            })
+        finally:
+            self.active_rooms.pop(room.room_id, None)
+            self.player_to_room.pop(p1.user_id, None)
+            self.player_to_room.pop(p2.user_id, None)
 
-        del self.active_rooms[room.room_id]
-        self.player_to_room.pop(p1.user_id, None)
-        self.player_to_room.pop(p2.user_id, None)
+
+def _db_session() -> AsyncSession:
+    """Short-lived session for work started by the server itself (turn clock,
+    disconnect forfeit) rather than by a client action."""
+    from app.core.database import AsyncSessionLocal
+    return AsyncSessionLocal()
 
 
 game_manager = GameManager()
